@@ -1,0 +1,1078 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+format_paper.py
+
+按你在 Ask 阶段确认的“最终细则”对 Word( .docx )进行强自动版式处理，并输出新的 .docx。
+
+命令行示例：
+  python format_paper.py input.docx
+  python format_paper.py input.docx -o output.docx
+
+默认输出文件名：input_formatted.docx
+
+说明（重要）：
+  - TOC（目录）是 Word 的字段内容。脚本会修改 styles.xml 中 TOC1/TOC2/TOC3 的样式；
+    目录条目文本仍建议你在 Word 打开后手动“更新目录”一次。
+  - 脚注“每页重新编号”强依赖你原始模板的脚注设置与 Word 生成逻辑；
+    本脚本重点完成脚注正文的字体字号等版式统一，并尽量维持编号策略。
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Generator, Iterable, List, Optional, Tuple
+
+from docx import Document
+from docx.enum.section import WD_ORIENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Cm, Pt
+from docx.table import Table, _Cell
+from docx.text.paragraph import Paragraph
+
+from lxml import etree as LET
+
+
+# ---------------------------------------------------------------------------
+# 页面与版式常量（来自你确认的最终细则）
+# ---------------------------------------------------------------------------
+PAGE_WIDTH_CM = 21.0
+PAGE_HEIGHT_CM = 29.7
+
+MARGIN_TOP_CM = 2.54
+MARGIN_BOTTOM_CM = 2.54
+MARGIN_LEFT_CM = 3.17
+MARGIN_RIGHT_CM = 3.17
+
+GUTTER_CM = 0.0  # 装订线宽 0
+GUTTER_POSITION_LEFT = True
+
+HEADER_DISTANCE_CM = 1.5
+FOOTER_DISTANCE_CM = 1.75
+
+LINE_SPACING_MULTIPLE = 1.5  # 行距：1.5倍（Word 倍数模型）
+
+
+# ---------------------------------------------------------------------------
+# 字号映射（常见排版近似）
+# ---------------------------------------------------------------------------
+SIZE_SMALL_TWO_PT = 18  # 小二号
+SIZE_SMALL_THREE_PT = 15  # 小三号
+SIZE_FOUR_PT = 14  # 四号
+SIZE_SMALL_FOUR_PT = 12  # 小四号
+SIZE_FIVE_PT = 10.5  # 五号
+SIZE_SMALL_FIVE_PT = 9  # 小五号
+
+
+# ---------------------------------------------------------------------------
+# 字体
+# ---------------------------------------------------------------------------
+FONT_SONG = "宋体"
+FONT_KAI = "楷体"
+FONT_HEITI = "黑体"
+FONT_HUA_WEN_ZHONG_SONG = "华文中宋"
+FONT_EN = "Times New Roman"
+
+
+@dataclass(frozen=True)
+class FontSpec:
+    cn: str
+    en: str
+    size_pt: float
+    bold: bool = False
+
+
+# ---------------------------------------------------------------------------
+# 标题/图表/模块识别正则
+# ---------------------------------------------------------------------------
+RE_CHAPTER = re.compile(r"^第[一二三四五六七八九十百千零〇两]+章")
+RE_SECTION = re.compile(r"^第[一二三四五六七八九十百千零〇两]+节")
+
+# 文内一级：一、二、三
+RE_INTERNAL_L1 = re.compile(r"^[一二三四五六七八九十百千]+、")
+# 文内二级：（一）（二）
+RE_INTERNAL_L2 = re.compile(r"^（[一二三四五六七八九十百千]+）")
+
+# 图/表题注：通常形如“图1 标题”或“表1-1 标题”
+RE_FIG_CAPTION = re.compile(r"^图\s*([\d]+(?:[-\.][\d]+)*)\s*(.*)$")
+RE_TAB_CAPTION = re.compile(r"^表\s*([\d]+(?:[-\.][\d]+)*)\s*(.*)$")
+
+MODULE_TITLES = ["摘要", "关键词", "目录", "引言"]
+
+
+# ---------------------------------------------------------------------------
+# OOXML 命名空间
+# ---------------------------------------------------------------------------
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def _pt_to_twips(pt: float) -> int:
+    """1pt = 20 twips（Word 的内部单位）。"""
+    return int(round(pt * 20))
+
+
+def _get_or_add_pPr(p: LET._Element) -> LET._Element:
+    """确保段落元素具有 w:pPr。"""
+    pPr = p.find(qn("w:pPr"))
+    if pPr is None:
+        pPr = LET.Element(qn("w:pPr"))
+        p.insert(0, pPr)
+    return pPr
+
+
+def set_outline_level(paragraph: Paragraph, outline_lvl: int) -> None:
+    """设置大纲级别（w:outlineLvl），用于目录收录。"""
+    p = paragraph._p
+    pPr = _get_or_add_pPr(p)
+    outline = pPr.find(qn("w:outlineLvl"))
+    if outline is None:
+        outline = LET.SubElement(pPr, qn("w:outlineLvl"))
+    outline.set(qn("w:val"), str(outline_lvl))
+
+
+def set_page_break_before(paragraph: Paragraph, enabled: bool = True) -> None:
+    """设置强制分页（w:pageBreakBefore）。"""
+    p = paragraph._p
+    pPr = _get_or_add_pPr(p)
+    el = pPr.find(qn("w:pageBreakBefore"))
+    if enabled:
+        if el is None:
+            el = LET.SubElement(pPr, qn("w:pageBreakBefore"))
+        el.set(qn("w:val"), "1")
+    else:
+        if el is not None:
+            pPr.remove(el)
+
+
+def set_hanging_indent(paragraph: Paragraph, hanging_pt: float) -> None:
+    """设置悬挂缩进（w:ind w:hanging）。用于参考文献内容。"""
+    p = paragraph._p
+    pPr = _get_or_add_pPr(p)
+    ind = pPr.find(qn("w:ind"))
+    if ind is None:
+        ind = LET.SubElement(pPr, qn("w:ind"))
+
+    ind.set(qn("w:hanging"), str(_pt_to_twips(hanging_pt)))
+
+    # 避免与 firstLine 冲突
+    first = ind.find(qn("w:firstLine"))
+    if first is not None:
+        ind.remove(first)
+
+
+def set_paragraph_line_spacing_multiple(paragraph: Paragraph, multiple: float) -> None:
+    pf = paragraph.paragraph_format
+    pf.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
+    pf.line_spacing = multiple
+
+
+def set_paragraph_line_spacing_single(paragraph: Paragraph) -> None:
+    pf = paragraph.paragraph_format
+    pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+
+
+def set_run_font(run, spec: FontSpec) -> None:
+    """设置 run 的中英文字体与字号（通过 w:rFonts）。"""
+    run.font.name = spec.en
+    run.font.size = Pt(spec.size_pt)
+    run.font.bold = spec.bold
+
+    r = run._element
+    rPr = r.get_or_add_rPr()
+    rFonts = rPr.get_or_add_rFonts()
+    rFonts.set(qn("w:ascii"), spec.en)
+    rFonts.set(qn("w:hAnsi"), spec.en)
+    rFonts.set(qn("w:eastAsia"), spec.cn)
+    rFonts.set(qn("w:cs"), spec.en)
+
+
+def apply_font_to_paragraph(paragraph: Paragraph, spec: FontSpec) -> None:
+    """对段落内所有 run 统一套用字体 spec。"""
+    for run in paragraph.runs:
+        set_run_font(run, spec)
+
+
+def apply_paragraph_style(
+    paragraph: Paragraph,
+    *,
+    spec: FontSpec,
+    alignment: WD_ALIGN_PARAGRAPH,
+    first_line_indent_chars: int = 0,
+    space_before_pt: float = 0.0,
+    space_after_pt: float = 0.0,
+    line_spacing_multiple: Optional[float] = None,
+    line_spacing_single: bool = False,
+) -> None:
+    """通用段落样式：字体/对齐/缩进/段前段后/行距。"""
+    pf = paragraph.paragraph_format
+    pf.alignment = alignment
+    pf.space_before = Pt(space_before_pt)
+    pf.space_after = Pt(space_after_pt)
+
+    if first_line_indent_chars > 0:
+        pf.first_line_indent = Pt(spec.size_pt * first_line_indent_chars)
+    else:
+        pf.first_line_indent = None
+
+    if line_spacing_single:
+        set_paragraph_line_spacing_single(paragraph)
+    elif line_spacing_multiple is not None:
+        set_paragraph_line_spacing_multiple(paragraph, line_spacing_multiple)
+
+    apply_font_to_paragraph(paragraph, spec)
+
+
+def paragraph_is_in_table_cell(paragraph: Paragraph) -> bool:
+    return isinstance(paragraph._parent, _Cell)
+
+
+def iter_paragraphs_in_document_order(doc: Document) -> Generator[Paragraph, None, None]:
+    """按 body 顺序深度优先遍历段落（包含表格与嵌套表格）。"""
+    body = doc.element.body
+    for child in body.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, doc)
+        elif child.tag == qn("w:tbl"):
+            yield from _iter_paragraphs_in_table(Table(child, doc))
+
+
+def _iter_paragraphs_in_table(table: Table) -> Generator[Paragraph, None, None]:
+    for row in table.rows:
+        for cell in row.cells:
+            yield from _iter_paragraphs_in_cell(cell)
+
+
+def _iter_paragraphs_in_cell(cell: _Cell) -> Generator[Paragraph, None, None]:
+    for child in cell._tc.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, cell)
+        elif child.tag == qn("w:tbl"):
+            yield from _iter_paragraphs_in_table(Table(child, cell))
+
+
+def iter_tables_recursive(doc: Document) -> Generator[Table, None, None]:
+    """递归遍历所有表格（包含嵌套表）。"""
+    def walk(tbl: Table):
+        yield tbl
+        for row in tbl.rows:
+            for cell in row.cells:
+                for nt in cell.tables:
+                    yield from walk(nt)
+
+    for t in doc.tables:
+        yield from walk(t)
+
+
+# ---------------------------------------------------------------------------
+# 页面设置 & 页码
+# ---------------------------------------------------------------------------
+def configure_all_sections(doc: Document) -> None:
+    """为文档每一节设置纸张大小、边距、页眉/页脚距。"""
+    for section in doc.sections:
+        section.orientation = WD_ORIENT.PORTRAIT
+        section.page_width = Cm(PAGE_WIDTH_CM)
+        section.page_height = Cm(PAGE_HEIGHT_CM)
+
+        section.top_margin = Cm(MARGIN_TOP_CM)
+        section.bottom_margin = Cm(MARGIN_BOTTOM_CM)
+        section.left_margin = Cm(MARGIN_LEFT_CM)
+        section.right_margin = Cm(MARGIN_RIGHT_CM)
+
+        section.header_distance = Cm(HEADER_DISTANCE_CM)
+        section.footer_distance = Cm(FOOTER_DISTANCE_CM)
+
+        # gutter/装订线：python-docx 支持有限，尽力设置
+        try:
+            section.gutter = Cm(GUTTER_CM)
+        except Exception:
+            pass
+
+
+def _add_page_number_field(paragraph: Paragraph) -> None:
+    """在段落中插入 PAGE 域。"""
+    run = paragraph.add_run()
+    r = run._r
+
+    fld_begin = OxmlElement("w:fldChar")
+    fld_begin.set(qn("w:fldCharType"), "begin")
+
+    instr = OxmlElement("w:instrText")
+    instr.set(qn("xml:space"), "preserve")
+    instr.text = " PAGE "
+
+    fld_sep = OxmlElement("w:fldChar")
+    fld_sep.set(qn("w:fldCharType"), "separate")
+
+    fld_end = OxmlElement("w:fldChar")
+    fld_end.set(qn("w:fldCharType"), "end")
+
+    r.append(fld_begin)
+    r.append(instr)
+    r.append(fld_sep)
+    r.append(fld_end)
+
+
+def paragraph_has_page_field(paragraph: Paragraph) -> bool:
+    """检测段落是否包含 PAGE 域（通过 w:instrText）。"""
+    for el in paragraph._p.findall(".//" + qn("w:instrText")):
+        txt = (el.text or "").strip().upper()
+        if txt == "PAGE" or "PAGE" in txt:
+            return True
+    return False
+
+
+def ensure_footer_page_numbers_centered(doc: Document) -> None:
+    """
+    在每一节页脚中：
+      - 若已存在包含 PAGE 域的段落：仅改该段落对齐居中
+      - 若不存在：新增一个仅包含 PAGE 域的段落并居中
+    """
+    for section in doc.sections:
+        footer = section.footer
+        if len(footer.paragraphs) == 0:
+            footer.add_paragraph()
+
+        page_para: Optional[Paragraph] = None
+        for p in footer.paragraphs:
+            if paragraph_has_page_field(p):
+                page_para = p
+                break
+
+        if page_para is not None:
+            page_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        else:
+            page_para = footer.add_paragraph()
+            page_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            _add_page_number_field(page_para)
+
+
+def patch_page_number_start_from_intro(docx_path: Path, intro_title: str = "引言", start_value: int = 1) -> Tuple[bool, str]:
+    """
+    修改 word/document.xml：
+      - 找到“引言”所在的 section
+      - 将该 section 的 w:pgNumType/@w:start 设置为 start_value
+
+    由于 docx 结构中 w:sectPr 的位置与“section 边界”有启发式关系，
+    本实现基于常见 Word 生成结构的顺序遍历进行映射。
+    """
+    try:
+        with zipfile.ZipFile(docx_path, "r") as zin:
+            xml = zin.read("word/document.xml")
+
+        root = LET.fromstring(xml)
+        ns = {"w": W_NS}
+        body = root.find("w:body", ns)
+        if body is None:
+            return False, "document.xml 缺少 w:body"
+
+        section_idx = 0
+        intro_section_idx: Optional[int] = None
+        sectpr_for_section: dict[int, LET._Element] = {}  # section_idx -> its sectPr element
+
+        for node in body.iterchildren():
+            if node.tag != qn("w:p"):
+                continue
+            text = "".join(node.itertext()).strip()
+            if intro_section_idx is None and text == intro_title:
+                intro_section_idx = section_idx
+
+            sectpr = node.find("w:sectPr", ns)
+            if sectpr is not None:
+                # sectPr 通常对应“下一 section”的属性（常见结构）
+                sectpr_for_section[section_idx + 1] = sectpr
+                section_idx += 1
+
+        if intro_section_idx is None:
+            return False, "未在 document.xml 中找到与 intro_title 完全匹配的段落"
+
+        target_sectpr = sectpr_for_section.get(intro_section_idx)
+        if target_sectpr is None:
+            # 兜底：如果 intro 落在第 1 个 section（intro_section_idx=0），我们的启发式映射可能拿不到对应 sectPr。
+            # 此时直接修改 document.xml 中第一个 pgNumType 的 start（不保证绝对正确，但能避免完全失败）。
+            if intro_section_idx == 0:
+                pg_all = root.findall(".//w:pgNumType", ns)
+                if not pg_all:
+                    return False, "兜底失败：未找到任何 w:pgNumType"
+                pg_all[0].set(qn("w:start"), str(start_value))
+            else:
+                return False, f"未找到 intro_section_idx={intro_section_idx} 对应的 sectPr"
+
+        pg = target_sectpr.find("w:pgNumType", ns)
+        if pg is None:
+            pg = LET.SubElement(target_sectpr, qn("w:pgNumType"))
+
+        pg.set(qn("w:numFmt"), "decimal")
+        pg.set(qn("w:start"), str(start_value))
+
+        tmp_path = docx_path.with_suffix(".tmp_patch.docx")
+        with zipfile.ZipFile(docx_path, "r") as zin, zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                if item.filename == "word/document.xml":
+                    new_xml = LET.tostring(root, encoding="utf-8", xml_declaration=True)
+                    zout.writestr(item, new_xml)
+                else:
+                    zout.writestr(item, zin.read(item.filename))
+
+        tmp_path.replace(docx_path)
+        return True, f"已设置引言 section 页码起算 start={start_value}"
+    except Exception as exc:
+        return False, f"patch_page_number_start_from_intro 失败：{exc}"
+
+
+def patch_footnotes_style(docx_path: Path) -> Tuple[bool, str]:
+    """
+    尽量统一脚注内容的字体与字号：
+      - 中文宋体、英文 Times New Roman
+      - 五号/小五等：此处按你的细则使用小五（9pt）
+
+    说明：脚注“每页重新编号”属于模板/Word 设置强依赖，脚本不保证能 100% 改到位。
+    """
+    try:
+        with zipfile.ZipFile(docx_path, "r") as zf:
+            # footnotes.xml 可能不存在
+            if "word/footnotes.xml" not in zf.namelist():
+                return False, "未找到 word/footnotes.xml（可能没有脚注）"
+            footnotes_xml = zf.read("word/footnotes.xml")
+
+        root = LET.fromstring(footnotes_xml)
+        ns = {"w": W_NS}
+
+        sz_half_points = int(round(SIZE_SMALL_FIVE_PT * 2))  # 9pt => 18
+
+        # 修改所有 run 的字体/字号
+        for rPr in root.findall(".//w:rPr", ns):
+            rFonts = rPr.find("w:rFonts", ns)
+            if rFonts is None:
+                rFonts = LET.SubElement(rPr, qn("w:rFonts"))
+            rFonts.set(qn("w:eastAsia"), FONT_SONG)
+            rFonts.set(qn("w:ascii"), FONT_EN)
+            rFonts.set(qn("w:hAnsi"), FONT_EN)
+            rFonts.set(qn("w:cs"), FONT_EN)
+
+            sz = rPr.find("w:sz", ns)
+            if sz is None:
+                sz = LET.SubElement(rPr, qn("w:sz"))
+            sz.set(qn("w:val"), str(sz_half_points))
+
+            szCs = rPr.find("w:szCs", ns)
+            if szCs is None:
+                szCs = LET.SubElement(rPr, qn("w:szCs"))
+            szCs.set(qn("w:val"), str(sz_half_points))
+
+        # 修改段落对齐（两端对齐）与行距：尽量不覆盖缩进逻辑，只做 jc 与 spacing
+        for p in root.findall(".//w:p", ns):
+            pPr = p.find("w:pPr", ns)
+            if pPr is None:
+                pPr = LET.SubElement(p, qn("w:pPr"))
+            jc = pPr.find("w:jc", ns)
+            if jc is None:
+                jc = LET.SubElement(pPr, qn("w:jc"))
+            jc.set(qn("w:val"), "both")
+
+            # 行距单倍：line = font_size_pt * 1.0 * 20
+            spacing = pPr.find("w:spacing", ns)
+            if spacing is None:
+                spacing = LET.SubElement(pPr, qn("w:spacing"))
+            spacing.set(qn("w:before"), "0")
+            spacing.set(qn("w:after"), "0")
+            spacing.set(qn("w:lineRule"), "auto")
+            spacing.set(qn("w:line"), str(_pt_to_twips(SIZE_SMALL_FIVE_PT)))
+
+            # 脚注无缩进（尽量归零）
+            ind = pPr.find("w:ind", ns)
+            if ind is None:
+                ind = LET.SubElement(pPr, qn("w:ind"))
+            ind.set(qn("w:firstLine"), "0")
+            ind.set(qn("w:left"), "0")
+            ind.set(qn("w:right"), "0")
+
+        tmp_path = docx_path.with_suffix(".tmp_footnote_patch.docx")
+        with zipfile.ZipFile(docx_path, "r") as zin, zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                if item.filename == "word/footnotes.xml":
+                    new_xml = LET.tostring(root, encoding="utf-8", xml_declaration=True)
+                    zout.writestr(item, new_xml)
+                else:
+                    zout.writestr(item, zin.read(item.filename))
+        tmp_path.replace(docx_path)
+        return True, "已统一脚注内容字体/字号（小五）"
+    except Exception as exc:
+        return False, f"patch_footnotes_style 失败：{exc}"
+
+
+# ---------------------------------------------------------------------------
+# TOC 样式（通过修改 styles.xml 的 TOC1/TOC2/TOC3）
+# ---------------------------------------------------------------------------
+def patch_toc_styles(docx_path: Path) -> Tuple[bool, str]:
+    try:
+        with zipfile.ZipFile(docx_path, "r") as zf:
+            styles_xml = zf.read("word/styles.xml")
+
+        root = LET.fromstring(styles_xml)
+        ns = {"w": W_NS}
+
+        # styleId -> (cn_font, size_pt, first_line_chars)
+        # TOC1: 黑体四号，左右缩进0，无首行缩进
+        # TOC2: 黑体小四，首行缩进1字符
+        # TOC3: 宋体小四，首行缩进2字符
+        toc_specs = {
+            "TOC1": (FONT_HEITI, SIZE_FOUR_PT, 0),
+            "TOC2": (FONT_HEITI, SIZE_SMALL_FOUR_PT, 1),
+            "TOC3": (FONT_SONG, SIZE_SMALL_FOUR_PT, 2),
+        }
+
+        found = 0
+        for style_id, (cn_font, size_pt, first_line_chars) in toc_specs.items():
+            style_el = None
+            for st in root.findall(".//w:style", ns):
+                if st.get(qn("w:styleId")) == style_id:
+                    style_el = st
+                    break
+            if style_el is None:
+                continue
+            found += 1
+
+            # rPr/rFonts + 字号（w:sz 为半磅）
+            rPr = style_el.find("w:rPr", ns)
+            if rPr is None:
+                rPr = LET.SubElement(style_el, qn("w:rPr"))
+            rFonts = rPr.find("w:rFonts", ns)
+            if rFonts is None:
+                rFonts = LET.SubElement(rPr, qn("w:rFonts"))
+            rFonts.set(qn("w:eastAsia"), cn_font)
+            rFonts.set(qn("w:ascii"), FONT_EN)
+            rFonts.set(qn("w:hAnsi"), FONT_EN)
+            rFonts.set(qn("w:cs"), FONT_EN)
+
+            sz = rPr.find("w:sz", ns)
+            if sz is None:
+                sz = LET.SubElement(rPr, qn("w:sz"))
+            sz.set(qn("w:val"), str(int(round(size_pt * 2))))
+
+            # pPr：对齐两端、段前段后0、行距1.5倍
+            pPr = style_el.find("w:pPr", ns)
+            if pPr is None:
+                pPr = LET.SubElement(style_el, qn("w:pPr"))
+
+            jc = pPr.find("w:jc", ns)
+            if jc is None:
+                jc = LET.SubElement(pPr, qn("w:jc"))
+            jc.set(qn("w:val"), "both")
+
+            ind = pPr.find("w:ind", ns)
+            if ind is None:
+                ind = LET.SubElement(pPr, qn("w:ind"))
+            ind.set(qn("w:left"), "0")
+            ind.set(qn("w:right"), "0")
+            ind.set(qn("w:firstLine"), str(_pt_to_twips(size_pt * first_line_chars)))
+
+            spacing = pPr.find("w:spacing", ns)
+            if spacing is None:
+                spacing = LET.SubElement(pPr, qn("w:spacing"))
+            spacing.set(qn("w:before"), "0")
+            spacing.set(qn("w:after"), "0")
+            spacing.set(qn("w:lineRule"), "auto")
+            # 1.5 倍：line = font_size_pt * 1.5 * 20 (twips)
+            spacing.set(qn("w:line"), str(_pt_to_twips(size_pt * LINE_SPACING_MULTIPLE)))
+
+        if found == 0:
+            return False, "未在 styles.xml 找到 TOC1/TOC2/TOC3 样式"
+
+        tmp_path = docx_path.with_suffix(".tmp_toc_patch.docx")
+        with zipfile.ZipFile(docx_path, "r") as zin, zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                if item.filename == "word/styles.xml":
+                    new_styles_xml = LET.tostring(root, encoding="utf-8", xml_declaration=True)
+                    zout.writestr(item, new_styles_xml)
+                else:
+                    zout.writestr(item, zin.read(item.filename))
+        tmp_path.replace(docx_path)
+        return True, f"已更新 TOC 样式（找到 {found} 个）"
+    except Exception as exc:
+        return False, f"patch_toc_styles 失败：{exc}"
+
+
+# ---------------------------------------------------------------------------
+# 图/表题注：连续编号 + 样式
+# ---------------------------------------------------------------------------
+def format_caption_paragraph(p: Paragraph, kind: str, new_no: int) -> None:
+    """将段落开头重写为 '图 {n}' 或 '表 {n}'，并保留标题余文。"""
+    text = (p.text or "").strip()
+    if kind == "图":
+        m = RE_FIG_CAPTION.match(text)
+        if not m:
+            return
+        rest = (m.group(2) or "").strip()
+        p.text = f"图 {new_no} {rest}".strip()
+    else:
+        m = RE_TAB_CAPTION.match(text)
+        if not m:
+            return
+        rest = (m.group(2) or "").strip()
+        p.text = f"表 {new_no} {rest}".strip()
+
+
+def apply_caption_style(p: Paragraph) -> None:
+    """图/表题注样式：宋体五号、居中、单倍行距、段前段后0。"""
+    spec = FontSpec(cn=FONT_SONG, en=FONT_EN, size_pt=SIZE_FIVE_PT, bold=False)
+    pf = p.paragraph_format
+    pf.space_before = Pt(0)
+    pf.space_after = Pt(0)
+    pf.first_line_indent = None
+    pf.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    set_paragraph_line_spacing_single(p)
+    apply_font_to_paragraph(p, spec)
+
+
+# ---------------------------------------------------------------------------
+# 参考文献块
+# ---------------------------------------------------------------------------
+def is_reference_title(text: str) -> bool:
+    return (text or "").strip() == "参考文献"
+
+
+def is_reference_block_end(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t in ("致谢", "附录", "独创性声明", "论文使用授权声明"):
+        return True
+    if RE_CHAPTER.match(t):
+        return True
+    return False
+
+
+def apply_reference_title(p: Paragraph) -> None:
+    spec = FontSpec(cn=FONT_HEITI, en=FONT_EN, size_pt=SIZE_SMALL_TWO_PT, bold=False)
+    apply_paragraph_style(
+        p,
+        spec=spec,
+        alignment=WD_ALIGN_PARAGRAPH.CENTER,
+        first_line_indent_chars=0,
+        space_before_pt=0,
+        space_after_pt=0,
+        line_spacing_multiple=LINE_SPACING_MULTIPLE,
+    )
+    set_outline_level(p, 1)
+
+
+def apply_reference_content(p: Paragraph) -> None:
+    spec = FontSpec(cn=FONT_SONG, en=FONT_EN, size_pt=SIZE_SMALL_FOUR_PT, bold=False)
+    apply_paragraph_style(
+        p,
+        spec=spec,
+        alignment=WD_ALIGN_PARAGRAPH.JUSTIFY,
+        first_line_indent_chars=0,
+        space_before_pt=0,
+        space_after_pt=0,
+        line_spacing_multiple=LINE_SPACING_MULTIPLE,
+    )
+    # 悬挂缩进：约 2 字符（这里用 2*font_size_pt 的近似）
+    set_hanging_indent(p, hanging_pt=spec.size_pt * 2)
+
+
+# ---------------------------------------------------------------------------
+# 简易长直接引用识别（>100字且包含中文引号“ ”）
+# ---------------------------------------------------------------------------
+def maybe_apply_long_direct_quote(p: Paragraph) -> None:
+    text = (p.text or "").strip()
+    if len(text.replace(" ", "")) <= 100:
+        return
+    if "“" not in text or "”" not in text:
+        return
+
+    # 长引文：楷体、小四；左右各缩进3字符；不强制删除引号（避免破坏文本）
+    spec = FontSpec(cn=FONT_KAI, en=FONT_EN, size_pt=SIZE_SMALL_FOUR_PT, bold=False)
+    pf = p.paragraph_format
+    pf.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    pf.space_before = Pt(0)
+    pf.space_after = Pt(0)
+    pf.first_line_indent = None
+    pf.left_indent = Pt(spec.size_pt * 3)
+    pf.right_indent = Pt(spec.size_pt * 3)
+    set_paragraph_line_spacing_multiple(p, LINE_SPACING_MULTIPLE)
+    apply_font_to_paragraph(p, spec)
+
+
+# ---------------------------------------------------------------------------
+# 主体样式应用
+# ---------------------------------------------------------------------------
+def style_tables(doc: Document) -> None:
+    """表格内文字：宋体五号；表头（第一行）楷体五号。"""
+    body_spec = FontSpec(cn=FONT_SONG, en=FONT_EN, size_pt=SIZE_FIVE_PT, bold=False)
+    header_spec = FontSpec(cn=FONT_KAI, en=FONT_EN, size_pt=SIZE_FIVE_PT, bold=False)
+
+    for table in iter_tables_recursive(doc):
+        for row_idx, row in enumerate(table.rows):
+            spec = header_spec if row_idx == 0 else body_spec
+            for cell in row.cells:
+                for par in cell.paragraphs:
+                    par.paragraph_format.first_line_indent = None
+                    par.paragraph_format.space_before = Pt(0)
+                    par.paragraph_format.space_after = Pt(0)
+                    par.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER if row_idx == 0 else WD_ALIGN_PARAGRAPH.JUSTIFY
+                    set_paragraph_line_spacing_single(par)
+                    apply_font_to_paragraph(par, spec)
+
+
+def apply_all_styles(doc: Document) -> Tuple[List[str], List[str]]:
+    """
+    执行格式化，返回 warnings/actions。
+    """
+    warnings: List[str] = []
+    actions: List[str] = []
+
+    configure_all_sections(doc)
+    ensure_footer_page_numbers_centered(doc)
+
+    # 收集“非表格段落”的有序列表，用于模块/标题边界判断
+    non_table_paras: List[Paragraph] = []
+    for p in iter_paragraphs_in_document_order(doc):
+        if not paragraph_is_in_table_cell(p):
+            non_table_paras.append(p)
+
+    # 表格样式
+    style_tables(doc)
+
+    # 默认正文样式（非表格）：宋体小四、两端对齐、首行缩进2字符、段前段后0、行距1.5倍
+    body_spec = FontSpec(cn=FONT_SONG, en=FONT_EN, size_pt=SIZE_SMALL_FOUR_PT, bold=False)
+    for p in non_table_paras:
+        if (p.text or "").strip() == "":
+            continue
+        apply_paragraph_style(
+            p,
+            spec=body_spec,
+            alignment=WD_ALIGN_PARAGRAPH.JUSTIFY,
+            first_line_indent_chars=2,
+            space_before_pt=0,
+            space_after_pt=0,
+            line_spacing_multiple=LINE_SPACING_MULTIPLE,
+        )
+
+    # 论文题目：文档第一个段落（非空）
+    title_para = None
+    for p in non_table_paras:
+        if (p.text or "").strip():
+            title_para = p
+            break
+    if title_para is None:
+        warnings.append("未找到论文题目段落（文档无非空段落）")
+    else:
+        title_spec = FontSpec(cn=FONT_HEITI, en=FONT_EN, size_pt=SIZE_SMALL_TWO_PT, bold=False)
+        apply_paragraph_style(
+            title_para,
+            spec=title_spec,
+            alignment=WD_ALIGN_PARAGRAPH.CENTER,
+            first_line_indent_chars=0,
+            space_before_pt=0,
+            space_after_pt=0,
+            line_spacing_multiple=LINE_SPACING_MULTIPLE,
+        )
+
+    # 前置模块边界：按“下一个模块标题出现为止”
+    def find_module_idx(text: str) -> Optional[int]:
+        for i, p in enumerate(non_table_paras):
+            if (p.text or "").strip() == text:
+                return i
+        # 关键词/可能带冒号的兼容
+        if text == "关键词":
+            for i, p in enumerate(non_table_paras):
+                if (p.text or "").strip().startswith("关键词"):
+                    return i
+        return None
+
+    idx_summary = find_module_idx("摘要")
+    idx_keywords = find_module_idx("关键词")
+    idx_toc = find_module_idx("目录")
+    idx_intro = find_module_idx("引言")
+
+    if idx_summary is None:
+        warnings.append("未找到“摘要”标题段落（exact text == 摘要）")
+    if idx_keywords is None:
+        warnings.append("未找到“关键词”标题段落（exact text == 关键词 或 startswith 关键词）")
+    if idx_toc is None:
+        warnings.append("未找到“目录”标题段落（exact text == 目录）")
+    if idx_intro is None:
+        warnings.append("未找到“引言”标题段落（exact text == 引言）")
+
+    # 摘要样式
+    if idx_summary is not None:
+        lab_spec = FontSpec(cn=FONT_SONG, en=FONT_EN, size_pt=SIZE_FOUR_PT, bold=False)
+        apply_paragraph_style(
+            non_table_paras[idx_summary],
+            spec=lab_spec,
+            alignment=WD_ALIGN_PARAGRAPH.CENTER,
+            first_line_indent_chars=0,
+            space_before_pt=0,
+            space_after_pt=0,
+            line_spacing_multiple=LINE_SPACING_MULTIPLE,
+        )
+        end = idx_keywords if idx_keywords is not None else (idx_intro if idx_intro is not None else len(non_table_paras))
+        for j in range(idx_summary + 1, end):
+            apply_paragraph_style(
+                non_table_paras[j],
+                spec=body_spec,
+                alignment=WD_ALIGN_PARAGRAPH.JUSTIFY,
+                first_line_indent_chars=2,
+                space_before_pt=0,
+                space_after_pt=0,
+                line_spacing_multiple=LINE_SPACING_MULTIPLE,
+            )
+
+    # 关键词样式（label 段落 + 内容段落；脚本不强拆 run，仅对段落层级生效）
+    if idx_keywords is not None:
+        kw_label_spec = FontSpec(cn=FONT_SONG, en=FONT_EN, size_pt=SIZE_SMALL_FOUR_PT, bold=False)
+        apply_paragraph_style(
+            non_table_paras[idx_keywords],
+            spec=kw_label_spec,
+            alignment=WD_ALIGN_PARAGRAPH.JUSTIFY,
+            first_line_indent_chars=2,
+            space_before_pt=0,
+            space_after_pt=0,
+            line_spacing_multiple=LINE_SPACING_MULTIPLE,
+        )
+        end = idx_toc if idx_toc is not None else (idx_intro if idx_intro is not None else len(non_table_paras))
+        for j in range(idx_keywords + 1, end):
+            apply_paragraph_style(
+                non_table_paras[j],
+                spec=body_spec,
+                alignment=WD_ALIGN_PARAGRAPH.JUSTIFY,
+                first_line_indent_chars=2,
+                space_before_pt=0,
+                space_after_pt=0,
+                line_spacing_multiple=LINE_SPACING_MULTIPLE,
+            )
+
+    # 目录标题“目录”二字（TOC 内容由 TOC 样式控制）
+    if idx_toc is not None:
+        toc_title_spec = FontSpec(cn=FONT_HEITI, en=FONT_EN, size_pt=SIZE_SMALL_TWO_PT, bold=False)
+        apply_paragraph_style(
+            non_table_paras[idx_toc],
+            spec=toc_title_spec,
+            alignment=WD_ALIGN_PARAGRAPH.CENTER,
+            first_line_indent_chars=0,
+            space_before_pt=0,
+            space_after_pt=0,
+            line_spacing_multiple=LINE_SPACING_MULTIPLE,
+        )
+
+    # 引言样式
+    chapter_start_idx: Optional[int] = None
+    if idx_intro is not None:
+        # 引言标题二字
+        intro_title_spec = FontSpec(cn=FONT_HEITI, en=FONT_EN, size_pt=SIZE_SMALL_TWO_PT, bold=False)
+        apply_paragraph_style(
+            non_table_paras[idx_intro],
+            spec=intro_title_spec,
+            alignment=WD_ALIGN_PARAGRAPH.CENTER,
+            first_line_indent_chars=0,
+            space_before_pt=0,
+            space_after_pt=0,
+            line_spacing_multiple=LINE_SPACING_MULTIPLE,
+        )
+        set_outline_level(non_table_paras[idx_intro], 1)
+
+        # 引言正文直到下一“章标题”或文末
+        for i in range(idx_intro + 1, len(non_table_paras)):
+            if RE_CHAPTER.match((non_table_paras[i].text or "").strip()):
+                chapter_start_idx = i
+                break
+
+        end = chapter_start_idx if chapter_start_idx is not None else len(non_table_paras)
+        for j in range(idx_intro + 1, end):
+            apply_paragraph_style(
+                non_table_paras[j],
+                spec=body_spec,
+                alignment=WD_ALIGN_PARAGRAPH.JUSTIFY,
+                first_line_indent_chars=2,
+                space_before_pt=0,
+                space_after_pt=0,
+                line_spacing_multiple=LINE_SPACING_MULTIPLE,
+            )
+
+    # 标题识别：章/节/文内一级/文内二级
+    # 注：只对非表格段落处理；章节强制分页。
+    for p in non_table_paras:
+        t = (p.text or "").strip()
+        if not t:
+            continue
+
+        if RE_CHAPTER.match(t):
+            ch_spec = FontSpec(cn=FONT_HEITI, en=FONT_EN, size_pt=SIZE_SMALL_TWO_PT, bold=False)
+            apply_paragraph_style(
+                p,
+                spec=ch_spec,
+                alignment=WD_ALIGN_PARAGRAPH.CENTER,
+                first_line_indent_chars=0,
+                space_before_pt=SIZE_SMALL_TWO_PT,  # 段前1行（近似）
+                space_after_pt=SIZE_SMALL_TWO_PT,  # 段后1行（近似）
+                line_spacing_multiple=LINE_SPACING_MULTIPLE,
+            )
+            set_outline_level(p, 1)
+            set_page_break_before(p, True)
+        elif RE_SECTION.match(t):
+            se_spec = FontSpec(cn=FONT_HEITI, en=FONT_EN, size_pt=SIZE_SMALL_THREE_PT, bold=False)
+            apply_paragraph_style(
+                p,
+                spec=se_spec,
+                alignment=WD_ALIGN_PARAGRAPH.CENTER,
+                first_line_indent_chars=0,
+                space_before_pt=SIZE_SMALL_THREE_PT * 0.5,  # 0.5行（近似）
+                space_after_pt=SIZE_SMALL_THREE_PT * 0.5,
+                line_spacing_multiple=LINE_SPACING_MULTIPLE,
+            )
+            set_outline_level(p, 2)
+        elif RE_INTERNAL_L1.match(t):
+            # 文内一级：华文中宋四号，两端对齐，首行缩进2字符，段前/段后0.5行
+            l1_spec = FontSpec(cn=FONT_HUA_WEN_ZHONG_SONG, en=FONT_EN, size_pt=SIZE_FOUR_PT, bold=False)
+            apply_paragraph_style(
+                p,
+                spec=l1_spec,
+                alignment=WD_ALIGN_PARAGRAPH.JUSTIFY,
+                first_line_indent_chars=2,
+                space_before_pt=SIZE_FOUR_PT * 0.5,
+                space_after_pt=SIZE_FOUR_PT * 0.5,
+                line_spacing_multiple=LINE_SPACING_MULTIPLE,
+            )
+            set_outline_level(p, 3)
+        elif RE_INTERNAL_L2.match(t):
+            # 文内二级：楷体小四号，两端对齐，首行缩进2字符，段前段后0
+            l2_spec = FontSpec(cn=FONT_KAI, en=FONT_EN, size_pt=SIZE_SMALL_FOUR_PT, bold=False)
+            apply_paragraph_style(
+                p,
+                spec=l2_spec,
+                alignment=WD_ALIGN_PARAGRAPH.JUSTIFY,
+                first_line_indent_chars=2,
+                space_before_pt=0,
+                space_after_pt=0,
+                line_spacing_multiple=LINE_SPACING_MULTIPLE,
+            )
+            set_outline_level(p, 4)
+
+    actions.append("已应用：页面设置/正文/前置模块/标题识别/章强制起页/图表题注/参考文献/长引文（部分）")
+
+    # 图/表题注：全文连续编号，遇到既有编号无条件重写
+    fig_no = 0
+    tab_no = 0
+    for p in non_table_paras:
+        t = (p.text or "").strip()
+        if not t:
+            continue
+        if t.startswith("图") and RE_FIG_CAPTION.match(t):
+            fig_no += 1
+            format_caption_paragraph(p, "图", fig_no)
+            apply_caption_style(p)
+        elif t.startswith("表") and RE_TAB_CAPTION.match(t):
+            tab_no += 1
+            format_caption_paragraph(p, "表", tab_no)
+            apply_caption_style(p)
+
+    # 参考文献块样式：从“参考文献”标题到停止条件
+    in_refs = False
+    for p in non_table_paras:
+        t = (p.text or "").strip()
+        if not t:
+            continue
+        if not in_refs and is_reference_title(t):
+            in_refs = True
+            apply_reference_title(p)
+            continue
+        if in_refs:
+            if is_reference_block_end(t):
+                in_refs = False
+            else:
+                apply_reference_content(p)
+
+    # 长直接引用版式：>100字且含引号“ ”（避免覆盖标题/题注/模块）
+    for p in non_table_paras:
+        t = (p.text or "").strip()
+        if not t:
+            continue
+        if RE_CHAPTER.match(t) or RE_SECTION.match(t) or RE_INTERNAL_L1.match(t) or RE_INTERNAL_L2.match(t):
+            continue
+        if t in ("摘要", "关键词", "目录", "引言", "参考文献"):
+            continue
+        if t.startswith("图") or t.startswith("表"):
+            continue
+        maybe_apply_long_direct_quote(p)
+
+    return warnings, actions
+
+
+def build_output_path(input_path: Path) -> Path:
+    """默认输出：<stem>_formatted.docx"""
+    return input_path.with_name(f"{input_path.stem}_formatted.docx")
+
+
+def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Format Word paper (.docx) with fixed thesis styles.")
+    parser.add_argument("input", type=str, help="Input .docx path")
+    parser.add_argument("-o", "--output", type=str, default=None, help="Output .docx path (default: <stem>_formatted.docx)")
+    return parser.parse_args(list(argv) if argv is not None else None)
+
+
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    args = parse_args(argv)
+    input_path = Path(args.input).expanduser().resolve()
+    if not input_path.exists() or not input_path.is_file():
+        print(f"错误：输入文件不存在：{input_path}", file=sys.stderr)
+        return 2
+    if input_path.suffix.lower() != ".docx":
+        print("错误：仅支持 .docx 文件。", file=sys.stderr)
+        return 2
+
+    out_path = Path(args.output).expanduser().resolve() if args.output else build_output_path(input_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        doc = Document(str(input_path))
+    except Exception as exc:
+        print(f"错误：读取 Word 失败：{exc}", file=sys.stderr)
+        return 3
+
+    try:
+        warnings, actions = apply_all_styles(doc)
+        doc.save(str(out_path))
+
+        # OOXML 修补：引言 section 起算页码 start=1
+        ok1, msg1 = patch_page_number_start_from_intro(out_path, intro_title="引言", start_value=1)
+        # OOXML 修补：TOC 样式
+        ok2, msg2 = patch_toc_styles(out_path)
+
+        # OOXML 修补：脚注内容字体/字号统一（小五）
+        ok3, msg3 = patch_footnotes_style(out_path)
+
+        if not ok1:
+            warnings.append(f"[页码起算] {msg1}")
+        if not ok2:
+            warnings.append(f"[TOC 样式] {msg2}")
+        if not ok3:
+            warnings.append(f"[脚注样式] {msg3}")
+
+        print(f"已完成格式化：{out_path}")
+        if msg1:
+            print(f"  - {msg1}")
+        if msg2:
+            print(f"  - {msg2}")
+        if msg3:
+            print(f"  - {msg3}")
+        if warnings:
+            print("需要人工复核的事项：")
+            for w in warnings:
+                print(f"  - {w}")
+        return 0
+    except Exception as exc:
+        print(f"错误：处理失败：{exc}", file=sys.stderr)
+        return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
